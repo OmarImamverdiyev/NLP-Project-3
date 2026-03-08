@@ -1,0 +1,10 @@
+Corpora/
+sentiment_dataset/
+
+__pycache__/
+
+# Ignore all Python cache folders
+# Ignore all Python cache folders
+**/__pycache__/
+
+sentiment_dataset/
