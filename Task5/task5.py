@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
 import math
 import random
 import re
@@ -34,6 +36,8 @@ DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 3
 DEFAULT_LEARNING_RATE = 1e-3
 DEFAULT_HIDDEN_SIZE = 64
+DEFAULT_MODEL_CACHE_DIR = "model_cache"
+DEFAULT_CACHE_MANIFEST_FILE = "model_cache_manifest.json"
 
 
 @dataclass
@@ -165,6 +169,65 @@ def resolve_vectors_file(project_root: Path, task_name: str) -> Path:
         if candidate.exists():
             return candidate
     raise FileNotFoundError(f"Could not find {task_name}/output/vectors.txt")
+
+
+def file_signature(path: Path) -> dict[str, str | int]:
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def build_cache_signature(
+    args: argparse.Namespace,
+    dataset_file: Path,
+    word2vec_file: Path,
+    glove_file: Path,
+) -> str:
+    payload = {
+        "dataset_file": file_signature(dataset_file),
+        "word2vec_file": file_signature(word2vec_file),
+        "glove_file": file_signature(glove_file),
+        "sample_size": int(args.sample_size),
+        "topics": int(args.topics),
+        "bow_features": int(args.bow_features),
+        "label_tfidf_features": int(args.label_tfidf_features),
+        "max_len": int(args.max_len),
+        "batch_size": int(args.batch_size),
+        "epochs": int(args.epochs),
+        "learning_rate": float(args.learning_rate),
+        "hidden_size": int(args.hidden_size),
+        "seed": int(args.seed),
+    }
+    serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def cache_slug(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", text.lower())
+    return slug.strip("_")
+
+
+def checkpoint_file_name(feature_name: str, model_name: str) -> str:
+    return f"{cache_slug(feature_name)}__{cache_slug(model_name)}.pt"
+
+
+def load_cache_manifest(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def save_cache_manifest(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=True, sort_keys=True)
 
 
 def normalize_text(text: str) -> str:
@@ -458,7 +521,26 @@ def train_and_score(
     num_classes: int,
     config: TrainConfig,
     device: torch.device,
-) -> tuple[dict[str, float], float]:
+    checkpoint_file: Path | None = None,
+    cache_signature: str | None = None,
+    feature_name: str = "",
+    model_name: str = "",
+) -> tuple[dict[str, float], float, bool]:
+    metric_keys = ("accuracy", "precision", "recall", "f1")
+
+    if checkpoint_file is not None and cache_signature and checkpoint_file.exists():
+        try:
+            checkpoint = torch.load(checkpoint_file, map_location="cpu")
+            if isinstance(checkpoint, dict) and checkpoint.get("cache_signature") == cache_signature:
+                cached_metrics = checkpoint.get("metrics")
+                if isinstance(cached_metrics, dict) and all(key in cached_metrics for key in metric_keys):
+                    metrics = {key: float(cached_metrics[key]) for key in metric_keys}
+                    train_seconds = float(checkpoint.get("train_seconds", 0.0))
+                    return metrics, train_seconds, True
+        except Exception:
+            # Corrupted or incompatible cache; retrain and overwrite.
+            pass
+
     train_loader, val_loader, test_loader = make_dataloaders(
         feature_set=feature_set,
         y_train=y_train,
@@ -534,7 +616,30 @@ def train_and_score(
         "recall": float(recall),
         "f1": float(f1),
     }
-    return metrics, float(train_seconds)
+
+    if checkpoint_file is not None and cache_signature:
+        state_dict_to_save = best_state
+        if state_dict_to_save is None:
+            state_dict_to_save = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+        checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "cache_signature": cache_signature,
+                "feature": feature_name,
+                "model": model_name,
+                "architecture": architecture,
+                "bidirectional": bidirectional,
+                "hidden_size": config.hidden_size,
+                "num_classes": int(num_classes),
+                "metrics": metrics,
+                "train_seconds": float(train_seconds),
+                "state_dict": state_dict_to_save,
+            },
+            checkpoint_file,
+        )
+
+    return metrics, float(train_seconds), False
 
 
 def format_table(df: pd.DataFrame) -> str:
@@ -600,6 +705,8 @@ def write_report(
         "",
         "- `output/task5_results.csv`",
         "- `output/task5_report.md`",
+        "- `output/model_cache/*.pt` (saved model checkpoints for each feature/model combination)",
+        "- `output/model_cache_manifest.json` (cache signature and checkpoint index)",
     ]
 
     with open(report_file, "w", encoding="utf-8", newline="\n") as handle:
@@ -629,10 +736,44 @@ def main() -> None:
     project_root = task_dir.parent
     output_dir = task_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
+    model_cache_dir = output_dir / DEFAULT_MODEL_CACHE_DIR
+    cache_manifest_file = output_dir / DEFAULT_CACHE_MANIFEST_FILE
+
+    csv_file = output_dir / "task5_results.csv"
+    report_file = output_dir / "task5_report.md"
 
     dataset_file = resolve_dataset_file(project_root)
     word2vec_file = resolve_vectors_file(project_root, "Task2")
     glove_file = resolve_vectors_file(project_root, "Task3")
+    cache_signature = build_cache_signature(args=args, dataset_file=dataset_file, word2vec_file=word2vec_file, glove_file=glove_file)
+
+    feature_order = ["Count Vectorizer", "TF-IDF", "PMI", "Word2Vec", "GloVe"]
+    model_settings = [
+        ("RNN", "rnn", False),
+        ("Bidirectional RNN", "rnn", True),
+        ("LSTM", "lstm", False),
+    ]
+    expected_checkpoint_files = [
+        model_cache_dir / checkpoint_file_name(feature_name, model_name)
+        for feature_name in feature_order
+        for model_name, _architecture, _bidirectional in model_settings
+    ]
+
+    cache_manifest = load_cache_manifest(cache_manifest_file)
+    if (
+        cache_manifest is not None
+        and cache_manifest.get("cache_signature") == cache_signature
+        and csv_file.exists()
+        and report_file.exists()
+        and all(path.exists() for path in expected_checkpoint_files)
+    ):
+        print("Using cached Task5 models and previous metrics.")
+        print(f"Cache signature: {cache_signature}")
+        print(f"Results CSV: {csv_file}")
+        print(f"Report: {report_file}")
+        print("")
+        print(format_table(pd.read_csv(csv_file)))
+        return
 
     print("Loading documents...")
     docs = load_documents(dataset_file=dataset_file, sample_size=args.sample_size, random_seed=args.seed)
@@ -684,19 +825,15 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    model_settings = [
-        ("RNN", "rnn", False),
-        ("Bidirectional RNN", "rnn", True),
-        ("LSTM", "lstm", False),
-    ]
-
     num_classes = int(np.unique(labels).size)
     results: list[dict[str, float | str]] = []
+    cache_hit_count = 0
 
     for feature_name, feature_set in feature_sets.items():
         for model_name, architecture, bidirectional in model_settings:
+            checkpoint_file = model_cache_dir / checkpoint_file_name(feature_name, model_name)
             print(f"Training {model_name} on {feature_name}...")
-            metrics, seconds = train_and_score(
+            metrics, seconds, from_cache = train_and_score(
                 architecture=architecture,
                 bidirectional=bidirectional,
                 feature_set=feature_set,
@@ -706,7 +843,13 @@ def main() -> None:
                 num_classes=num_classes,
                 config=train_config,
                 device=device,
+                checkpoint_file=checkpoint_file,
+                cache_signature=cache_signature,
+                feature_name=feature_name,
+                model_name=model_name,
             )
+            if from_cache:
+                cache_hit_count += 1
             results.append(
                 {
                     "feature": feature_name,
@@ -716,18 +859,16 @@ def main() -> None:
                     "recall": metrics["recall"],
                     "f1": metrics["f1"],
                     "train_seconds": seconds,
+                    "source": "cache" if from_cache else "trained",
                 }
             )
 
     results_df = pd.DataFrame(results)
-    feature_order = ["Count Vectorizer", "TF-IDF", "PMI", "Word2Vec", "GloVe"]
     model_order = {"RNN": 0, "Bidirectional RNN": 1, "LSTM": 2}
     results_df["feature_order"] = results_df["feature"].map({name: idx for idx, name in enumerate(feature_order)})
     results_df["model_order"] = results_df["model"].map(model_order)
     results_df = results_df.sort_values(["feature_order", "model_order"]).drop(columns=["feature_order", "model_order"])
 
-    csv_file = output_dir / "task5_results.csv"
-    report_file = output_dir / "task5_report.md"
     results_df.to_csv(csv_file, index=False)
     write_report(
         report_file=report_file,
@@ -740,10 +881,36 @@ def main() -> None:
         train_config=train_config,
         results_df=results_df,
     )
+    save_cache_manifest(
+        cache_manifest_file,
+        {
+            "cache_signature": cache_signature,
+            "generated_at_epoch": int(time.time()),
+            "dataset_file": file_signature(dataset_file),
+            "word2vec_file": file_signature(word2vec_file),
+            "glove_file": file_signature(glove_file),
+            "results_csv": str(csv_file),
+            "report_file": str(report_file),
+            "checkpoint_files": [str(path) for path in expected_checkpoint_files],
+            "args": {
+                "sample_size": int(args.sample_size),
+                "topics": int(args.topics),
+                "bow_features": int(args.bow_features),
+                "label_tfidf_features": int(args.label_tfidf_features),
+                "max_len": int(args.max_len),
+                "batch_size": int(args.batch_size),
+                "epochs": int(args.epochs),
+                "learning_rate": float(args.learning_rate),
+                "hidden_size": int(args.hidden_size),
+                "seed": int(args.seed),
+            },
+        },
+    )
 
     print("Task5 completed.")
     print(f"Results CSV: {csv_file}")
     print(f"Report: {report_file}")
+    print(f"Cached combinations reused in this run: {cache_hit_count}/{len(results)}")
     print("")
     print(format_table(results_df))
 
