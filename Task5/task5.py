@@ -27,7 +27,7 @@ TOKEN_PATTERN = re.compile(r"[^\W\d_]+", flags=re.UNICODE)
 csv.field_size_limit(2**31 - 1)
 
 DEFAULT_RANDOM_SEED = 42
-DEFAULT_SAMPLE_SIZE = 6000
+DEFAULT_SAMPLE_SIZE = 0
 DEFAULT_TOPIC_COUNT = 6
 DEFAULT_BOW_FEATURES = 200
 DEFAULT_LABEL_TFIDF_FEATURES = 2000
@@ -249,7 +249,7 @@ def load_documents(dataset_file: Path, sample_size: int | None, random_seed: int
         docs = [docs[int(idx)] for idx in indices]
 
     if len(docs) < 100:
-        raise RuntimeError("Too few documents available after filtering/sampling.")
+        raise RuntimeError("Too few documents available after filtering.")
 
     return docs
 
@@ -668,6 +668,7 @@ def write_report(
 ) -> None:
     best_idx = int(results_df["f1"].idxmax())
     best_row = results_df.loc[best_idx]
+    sampling_mode = "full filtered corpus" if sample_size <= 0 else f"capped at {sample_size} documents"
 
     lines = [
         "# Task5 - Text Classification with RNN Variants",
@@ -676,7 +677,8 @@ def write_report(
         "",
         f"- Dataset: `{dataset_file}`",
         "- Source corpus: `Corpora/News/content_only.csv`",
-        f"- Documents used in this run (after filtering + sampling): **{selected_docs}**",
+        f"- Documents used in this run (after filtering): **{selected_docs}**",
+        f"- Sampling mode: **{sampling_mode}**",
         "- Labeling note: this dataset has no gold label column, so pseudo-topic labels were created using TF-IDF + KMeans.",
         f"- Number of pseudo-topic classes: **{num_topics}**",
         "",
@@ -715,7 +717,12 @@ def write_report(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Task5: RNN/BiRNN/LSTM text classification comparison")
-    parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=DEFAULT_SAMPLE_SIZE,
+        help="Maximum number of filtered documents to use; set to 0 to use the full corpus.",
+    )
     parser.add_argument("--topics", type=int, default=DEFAULT_TOPIC_COUNT)
     parser.add_argument("--bow-features", type=int, default=DEFAULT_BOW_FEATURES)
     parser.add_argument("--label-tfidf-features", type=int, default=DEFAULT_LABEL_TFIDF_FEATURES)
@@ -874,7 +881,7 @@ def main() -> None:
         report_file=report_file,
         dataset_file=dataset_file,
         selected_docs=len(docs),
-        sample_size=len(docs),
+        sample_size=args.sample_size,
         num_topics=args.topics,
         bow_features=args.bow_features,
         max_len=args.max_len,
