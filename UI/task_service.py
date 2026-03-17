@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import csv
+import heapq
+import math
 import subprocess
 import sys
 import time
+from array import array
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from UI.cache_utils import all_files_exist, load_json, path_signature, save_json, stable_hash
 
@@ -205,6 +210,201 @@ def summarize_output(text: str, max_chars: int = 4000) -> str:
     if len(cleaned) <= max_chars:
         return cleaned
     return cleaned[-max_chars:]
+
+
+@lru_cache(maxsize=8)
+def _load_normalized_vectors_cached(
+    resolved_vectors_path: str,
+    file_size: int,
+    file_mtime_ns: int,
+) -> tuple[list[str], list[array], dict[str, int], int]:
+    del file_size, file_mtime_ns
+
+    vectors_path = Path(resolved_vectors_path)
+    words: list[str] = []
+    vectors: list[array] = []
+    index: dict[str, int] = {}
+    dimension: int | None = None
+
+    def append_vector(parts: list[str]) -> None:
+        nonlocal dimension
+
+        if dimension is None:
+            if len(parts) < 2:
+                raise ValueError(f"Unexpected vector format in {vectors_path}.")
+            dimension = len(parts) - 1
+
+        if len(parts) != dimension + 1:
+            return
+
+        word = parts[0]
+        try:
+            vector = array("f", (float(value) for value in parts[1:]))
+        except ValueError:
+            return
+
+        norm = math.sqrt(sum(component * component for component in vector))
+        if norm == 0:
+            return
+
+        for i in range(dimension):
+            vector[i] /= norm
+
+        index[word] = len(words)
+        words.append(word)
+        vectors.append(vector)
+
+    with open(vectors_path, "r", encoding="utf-8", errors="ignore") as handle:
+        first_parts = handle.readline().strip().split()
+        if not first_parts:
+            raise ValueError(f"Vector file is empty: {vectors_path}")
+
+        if len(first_parts) == 2 and all(part.isdigit() for part in first_parts):
+            dimension = int(first_parts[1])
+        else:
+            append_vector(first_parts)
+
+        for line in handle:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            append_vector(parts)
+
+    if dimension is None:
+        raise ValueError(f"Could not determine vector dimension for {vectors_path}.")
+
+    return words, vectors, index, dimension
+
+
+def _load_normalized_vectors(vectors_path: Path) -> tuple[list[str], list[array], dict[str, int], int]:
+    stat = vectors_path.stat()
+    return _load_normalized_vectors_cached(
+        str(vectors_path.resolve()),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+    )
+
+
+def _dot(a: array, b: array) -> float:
+    score = 0.0
+    for x, y in zip(a, b):
+        score += x * y
+    return score
+
+
+def _top_k_neighbors(
+    query_vector: array,
+    words: list[str],
+    vectors: list[array],
+    exclude: set[str],
+    limit: int,
+) -> list[tuple[str, float]]:
+    heap: list[tuple[float, str]] = []
+    for word, vector in zip(words, vectors):
+        if word in exclude:
+            continue
+        similarity = _dot(query_vector, vector)
+        if len(heap) < limit:
+            heapq.heappush(heap, (similarity, word))
+        elif similarity > heap[0][0]:
+            heapq.heapreplace(heap, (similarity, word))
+
+    return [(word, score) for score, word in sorted(heap, reverse=True)]
+
+
+def _prefix_suggestions(query_word: str, words: list[str], limit: int = 5) -> list[str]:
+    suggestions: list[str] = []
+    normalized_query = query_word.lower()
+    prefixes = [normalized_query]
+    if len(normalized_query) >= 3:
+        prefixes.append(normalized_query[:3])
+
+    for prefix in prefixes:
+        for word in words:
+            if word.startswith(prefix) and word not in suggestions:
+                suggestions.append(word)
+                if len(suggestions) >= limit:
+                    return suggestions
+
+    return suggestions
+
+
+def search_similar_words(vectors_path: Path, query_word: str, limit: int = 5) -> dict[str, Any]:
+    if not vectors_path.exists():
+        return {
+            "status": "missing_vectors",
+            "message": f"Vectors file not found: {vectors_path}",
+        }
+
+    normalized_query = query_word.strip().lower()
+    if not normalized_query:
+        return {
+            "status": "empty_query",
+            "message": "Enter a word to search.",
+        }
+
+    words, vectors, index, dimension = _load_normalized_vectors(vectors_path)
+    if normalized_query not in index:
+        suggestions = _prefix_suggestions(normalized_query, words)
+        return {
+            "status": "word_not_found",
+            "message": f"`{normalized_query}` is not in the saved vocabulary.",
+            "suggestions": suggestions,
+        }
+
+    neighbors = _top_k_neighbors(
+        query_vector=vectors[index[normalized_query]],
+        words=words,
+        vectors=vectors,
+        exclude={normalized_query},
+        limit=limit,
+    )
+
+    rows = [
+        {
+            "rank": rank,
+            "word": word,
+            "cosine_similarity": round(score, 6),
+        }
+        for rank, (word, score) in enumerate(neighbors, start=1)
+    ]
+
+    return {
+        "status": "ok",
+        "query_word": normalized_query,
+        "results": rows,
+        "vocab_size": len(words),
+        "dimension": dimension,
+    }
+
+
+def find_similar_words_for_task(task_id: str, query_word: str, limit: int = 5) -> dict[str, Any]:
+    if task_id not in {"task2", "task3"}:
+        raise ValueError(f"Interactive similarity search is not supported for {task_id}.")
+
+    return search_similar_words(TASK_OUTPUTS[task_id]["vectors"], query_word=query_word, limit=limit)
+
+
+def similarity_example_words(task_id: str, limit: int = 5) -> list[str]:
+    if task_id not in {"task2", "task3"}:
+        return []
+
+    synonyms_path = TASK_OUTPUTS[task_id]["synonyms"]
+    if not synonyms_path.exists():
+        return []
+
+    examples: list[str] = []
+    with open(synonyms_path, "r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            query_word = (row.get("query_word") or "").strip()
+            if not query_word or query_word in examples:
+                continue
+            examples.append(query_word)
+            if len(examples) >= limit:
+                break
+
+    return examples
 
 
 def list_task5_checkpoints() -> list[Path]:

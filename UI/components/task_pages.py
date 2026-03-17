@@ -8,7 +8,9 @@ import streamlit as st
 from UI.task_service import (
     PROJECT_ROOT,
     ensure_task_outputs,
+    find_similar_words_for_task,
     list_task5_checkpoints,
+    similarity_example_words,
     task_outputs,
     task_title,
 )
@@ -20,6 +22,10 @@ def _result_key(task_id: str) -> str:
 
 def _error_key(task_id: str) -> str:
     return f"error_{task_id}"
+
+
+def _similarity_result_key(task_id: str) -> str:
+    return f"similarity_result_{task_id}"
 
 
 def _run_task(task_id: str, force: bool) -> None:
@@ -96,6 +102,60 @@ def _render_file_size(path: Path, label: str) -> None:
     st.caption(f"{label}: `{path.relative_to(PROJECT_ROOT)}` ({size_mb:.2f} MB)")
 
 
+def _render_similarity_search(task_id: str, model_label: str, vectors_path: Path) -> None:
+    st.subheader("Interactive Similarity Search")
+    st.caption(f"Type a word from the saved {model_label} vocabulary to see its 5 most similar words.")
+
+    examples = similarity_example_words(task_id)
+    if examples:
+        st.caption("Example queries: " + ", ".join(f"`{word}`" for word in examples))
+
+    with st.form(key=f"similarity_form_{task_id}"):
+        query_word = st.text_input(
+            "Query word",
+            key=f"similarity_query_{task_id}",
+            placeholder="Enter a vocabulary word",
+        )
+        submitted = st.form_submit_button("Find 5 Similar Words", use_container_width=True)
+
+    if submitted:
+        try:
+            st.session_state[_similarity_result_key(task_id)] = find_similar_words_for_task(
+                task_id=task_id,
+                query_word=query_word,
+                limit=5,
+            )
+        except Exception as exc:
+            st.session_state[_similarity_result_key(task_id)] = {
+                "status": "error",
+                "message": str(exc),
+            }
+
+    result = st.session_state.get(_similarity_result_key(task_id))
+    if not result:
+        if not vectors_path.exists():
+            st.info("Run this task once to generate vectors, then use this search box.")
+        return
+
+    status = result.get("status", "")
+    if status == "ok":
+        st.caption(
+            f"Showing neighbors for `{result['query_word']}` "
+            f"from `{result['vocab_size']}` words with dimension `{result['dimension']}`."
+        )
+        st.dataframe(pd.DataFrame(result["results"]), use_container_width=True, hide_index=True)
+        return
+
+    if status in {"missing_vectors", "empty_query", "word_not_found"}:
+        st.warning(result.get("message", "Could not complete the similarity search."))
+        suggestions = result.get("suggestions") or []
+        if suggestions:
+            st.caption("Try one of these: " + ", ".join(f"`{word}`" for word in suggestions))
+        return
+
+    st.error(result.get("message", "Unexpected error while searching similar words."))
+
+
 def render_task1_page() -> None:
     outputs = task_outputs("task1")
     st.header(task_title("task1"))
@@ -114,6 +174,7 @@ def render_task2_page() -> None:
 
     _render_file_size(outputs["vectors"], "Word2Vec vectors")
     _render_file_size(outputs["vocab"], "Word2Vec vocabulary")
+    _render_similarity_search("task2", "Word2Vec", outputs["vectors"])
 
     _render_markdown(outputs["report"], "Report")
     _render_table(outputs["synonyms"], "Top-5 Synonyms", sep="\t", preview_rows=50)
@@ -128,6 +189,7 @@ def render_task3_page() -> None:
 
     _render_file_size(outputs["vectors"], "GloVe vectors")
     _render_file_size(outputs["vocab"], "GloVe vocabulary")
+    _render_similarity_search("task3", "GloVe", outputs["vectors"])
 
     _render_markdown(outputs["report"], "Report")
     _render_table(outputs["synonyms"], "Top-5 Synonyms", sep="\t", preview_rows=50)
