@@ -15,11 +15,11 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy import sparse
-from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 from torch import nn
+from torch.nn.utils.rnn import pack_padded_sequence
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -28,9 +28,7 @@ csv.field_size_limit(2**31 - 1)
 
 DEFAULT_RANDOM_SEED = 42
 DEFAULT_SAMPLE_SIZE = 0
-DEFAULT_TOPIC_COUNT = 6
 DEFAULT_BOW_FEATURES = 200
-DEFAULT_LABEL_TFIDF_FEATURES = 2000
 DEFAULT_EMBED_MAX_LEN = 80
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 3
@@ -38,6 +36,22 @@ DEFAULT_LEARNING_RATE = 1e-3
 DEFAULT_HIDDEN_SIZE = 64
 DEFAULT_MODEL_CACHE_DIR = "model_cache"
 DEFAULT_CACHE_MANIFEST_FILE = "model_cache_manifest.json"
+PIPELINE_VERSION = "sentiment140_supervised_dense_bow_v2"
+SENTIMENT_LABEL_NAMES = {
+    0: "negative",
+    2: "neutral",
+    4: "positive",
+}
+SEQUENCE_MODEL_SETTINGS = [
+    ("RNN", "rnn", False),
+    ("Bidirectional RNN", "rnn", True),
+    ("LSTM", "lstm", False),
+]
+DENSE_MODEL_SETTINGS = [
+    ("Linear", "linear", False),
+    ("MLP", "mlp", False),
+    ("Deep MLP", "deep_mlp", False),
+]
 
 
 @dataclass
@@ -50,6 +64,15 @@ class FeatureSet:
     test_len: np.ndarray
     embedding_matrix: np.ndarray | None
     is_token_feature: bool
+
+
+@dataclass
+class SentimentDataset:
+    docs: list[str]
+    labels: np.ndarray
+    label_to_index: dict[int, int]
+    class_distribution: dict[int, int]
+    available_rows: int
 
 
 @dataclass(frozen=True)
@@ -89,6 +112,7 @@ class RecurrentClassifier(nn.Module):
         super().__init__()
         self.embedding: nn.Embedding | None = None
         self.is_lstm = architecture == "lstm"
+        self.bidirectional = bidirectional
 
         if embedding_matrix is not None:
             embeddings = torch.tensor(embedding_matrix, dtype=torch.float32)
@@ -120,18 +144,57 @@ class RecurrentClassifier(nn.Module):
         self.classifier = nn.Linear(out_size, num_classes)
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        if self.embedding is not None:
-            sequence = self.embedding(x)
+        if self.embedding is None:
+            raise RuntimeError("RecurrentClassifier requires token-based features with an embedding matrix.")
+
+        sequence = self.embedding(x)
+        packed_sequence = pack_padded_sequence(sequence, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        _encoded, hidden = self.encoder(packed_sequence)
+
+        hidden_state = hidden[0] if self.is_lstm else hidden
+        if self.bidirectional:
+            final_hidden = torch.cat((hidden_state[-2], hidden_state[-1]), dim=1)
         else:
-            sequence = x.unsqueeze(-1)
+            final_hidden = hidden_state[-1]
 
-        encoded, _hidden = self.encoder(sequence)
-
-        safe_lengths = torch.clamp(lengths - 1, min=0)
-        row_idx = torch.arange(encoded.size(0), device=encoded.device)
-        final_hidden = encoded[row_idx, safe_lengths]
         logits = self.classifier(self.dropout(final_hidden))
         return logits
+
+
+class DenseClassifier(nn.Module):
+    def __init__(
+        self,
+        architecture: str,
+        input_size: int,
+        num_classes: int,
+        hidden_size: int,
+    ) -> None:
+        super().__init__()
+        if architecture == "linear":
+            self.network = nn.Linear(input_size, num_classes)
+        elif architecture == "mlp":
+            self.network = nn.Sequential(
+                nn.Linear(input_size, hidden_size),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(hidden_size, num_classes),
+            )
+        elif architecture == "deep_mlp":
+            self.network = nn.Sequential(
+                nn.Linear(input_size, hidden_size),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(hidden_size, hidden_size),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(hidden_size, num_classes),
+            )
+        else:
+            raise ValueError(f"Unsupported dense architecture: {architecture}")
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        del lengths
+        return self.network(x)
 
 
 def set_seed(seed: int) -> None:
@@ -142,22 +205,20 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def resolve_dataset_file(project_root: Path) -> Path:
+def resolve_dataset_file(task_dir: Path) -> Path:
     candidates = [
-        project_root / "Corpora" / "news" / "content_only.csv",
-        project_root / "Corpora" / "News" / "content_only.csv",
-        project_root / "corpora" / "news" / "content_only.csv",
+        task_dir / "Sentiment140_v2.csv",
+        task_dir / "sentiment140_v2.csv",
     ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
 
-    for candidate in project_root.rglob("content_only.csv"):
-        lowered = str(candidate).lower().replace("\\", "/")
-        if "/news/" in lowered:
+    for candidate in task_dir.rglob("*"):
+        if candidate.is_file() and candidate.name.lower() == "sentiment140_v2.csv":
             return candidate
 
-    raise FileNotFoundError("Could not find Corpora/news/content_only.csv.")
+    raise FileNotFoundError("Could not find Task5/Sentiment140_v2.csv.")
 
 
 def resolve_vectors_file(project_root: Path, task_name: str) -> Path:
@@ -190,10 +251,9 @@ def build_cache_signature(
         "dataset_file": file_signature(dataset_file),
         "word2vec_file": file_signature(word2vec_file),
         "glove_file": file_signature(glove_file),
+        "pipeline_version": PIPELINE_VERSION,
         "sample_size": int(args.sample_size),
-        "topics": int(args.topics),
         "bow_features": int(args.bow_features),
-        "label_tfidf_features": int(args.label_tfidf_features),
         "max_len": int(args.max_len),
         "batch_size": int(args.batch_size),
         "epochs": int(args.epochs),
@@ -238,37 +298,58 @@ def tokenize(text: str) -> list[str]:
     return [match.group(0).lower() for match in TOKEN_PATTERN.finditer(text)]
 
 
-def load_documents(dataset_file: Path, sample_size: int | None, random_seed: int) -> list[str]:
-    df = pd.read_csv(dataset_file, usecols=["content"], encoding="utf-8")
-    docs = [normalize_text(str(value)) for value in df["content"].dropna().tolist()]
-    docs = [doc for doc in docs if len(doc) >= 40]
-
-    if sample_size is not None and sample_size > 0 and len(docs) > sample_size:
-        rng = np.random.default_rng(random_seed)
-        indices = rng.choice(len(docs), size=sample_size, replace=False)
-        docs = [docs[int(idx)] for idx in indices]
-
-    if len(docs) < 100:
-        raise RuntimeError("Too few documents available after filtering.")
-
-    return docs
+def sentiment_label_name(label: int) -> str:
+    return SENTIMENT_LABEL_NAMES.get(label, f"class {label}")
 
 
-def create_pseudo_labels(
-    docs: list[str],
-    random_seed: int,
-    num_topics: int,
-    max_tfidf_features: int,
-) -> np.ndarray:
-    label_vectorizer = TfidfVectorizer(
-        max_features=max_tfidf_features,
-        min_df=5,
-        max_df=0.9,
-        token_pattern=r"(?u)\b[^\W\d_]+\b",
+def format_class_distribution(class_distribution: dict[int, int]) -> str:
+    return ", ".join(
+        f"{label} ({sentiment_label_name(label)}): {count}"
+        for label, count in sorted(class_distribution.items())
     )
-    x_topic = label_vectorizer.fit_transform(docs)
-    kmeans = KMeans(n_clusters=num_topics, random_state=random_seed, n_init=20)
-    return kmeans.fit_predict(x_topic).astype(np.int64)
+
+
+def load_sentiment_dataset(dataset_file: Path, sample_size: int | None, random_seed: int) -> SentimentDataset:
+    df = pd.read_csv(dataset_file, usecols=["polarity", "text"], encoding="utf-8")
+    df["polarity"] = pd.to_numeric(df["polarity"], errors="coerce")
+    df = df.dropna(subset=["polarity"]).copy()
+    df["polarity"] = df["polarity"].astype(int)
+    df["text"] = df["text"].fillna("").astype(str).map(normalize_text)
+
+    available_rows = int(len(df))
+    if available_rows < 100:
+        raise RuntimeError("Too few labeled rows available in Sentiment140_v2.csv.")
+
+    if sample_size is not None and sample_size > 0 and available_rows > sample_size:
+        unique_labels = int(df["polarity"].nunique())
+        if sample_size < unique_labels:
+            raise ValueError(
+                f"--sample-size must be at least the number of classes ({unique_labels}) for stratified sampling."
+            )
+        df, _unused = train_test_split(
+            df,
+            train_size=sample_size,
+            random_state=random_seed,
+            stratify=df["polarity"],
+        )
+
+    df = df.reset_index(drop=True)
+    label_values = sorted(int(value) for value in df["polarity"].unique().tolist())
+    if len(label_values) < 2:
+        raise RuntimeError("Sentiment140_v2.csv must contain at least two sentiment classes.")
+
+    label_to_index = {label: idx for idx, label in enumerate(label_values)}
+    labels = df["polarity"].map(label_to_index).to_numpy(dtype=np.int64)
+    class_distribution = {label: int((df["polarity"] == label).sum()) for label in label_values}
+    docs = df["text"].tolist()
+
+    return SentimentDataset(
+        docs=docs,
+        labels=labels,
+        label_to_index=label_to_index,
+        class_distribution=class_distribution,
+        available_rows=available_rows,
+    )
 
 
 def split_data(
@@ -475,6 +556,43 @@ def build_embedding_feature_set(
     )
 
 
+def model_settings_for_feature(feature_name: str) -> list[tuple[str, str, bool]]:
+    if feature_name in {"Word2Vec", "GloVe"}:
+        return SEQUENCE_MODEL_SETTINGS
+    return DENSE_MODEL_SETTINGS
+
+
+def build_classifier(
+    architecture: str,
+    bidirectional: bool,
+    feature_set: FeatureSet,
+    num_classes: int,
+    hidden_size: int,
+) -> nn.Module:
+    if feature_set.is_token_feature:
+        return RecurrentClassifier(
+            architecture=architecture,
+            num_classes=num_classes,
+            hidden_size=hidden_size,
+            bidirectional=bidirectional,
+            embedding_matrix=feature_set.embedding_matrix,
+        )
+
+    if bidirectional:
+        raise ValueError("Bidirectional models are only supported for token-based sequence features.")
+
+    input_size = int(feature_set.train_x.shape[1])
+    if input_size <= 0:
+        raise RuntimeError("Dense feature set is empty; cannot build classifier.")
+
+    return DenseClassifier(
+        architecture=architecture,
+        input_size=input_size,
+        num_classes=num_classes,
+        hidden_size=hidden_size,
+    )
+
+
 def make_dataloaders(
     feature_set: FeatureSet,
     y_train: np.ndarray,
@@ -549,12 +667,12 @@ def train_and_score(
         batch_size=config.batch_size,
     )
 
-    model = RecurrentClassifier(
+    model = build_classifier(
         architecture=architecture,
+        bidirectional=bidirectional,
+        feature_set=feature_set,
         num_classes=num_classes,
         hidden_size=config.hidden_size,
-        bidirectional=bidirectional,
-        embedding_matrix=feature_set.embedding_matrix,
     ).to(device)
 
     class_counts = np.bincount(y_train, minlength=num_classes).astype(np.float32)
@@ -658,29 +776,42 @@ def format_table(df: pd.DataFrame) -> str:
 def write_report(
     report_file: Path,
     dataset_file: Path,
-    selected_docs: int,
+    dataset: SentimentDataset,
     sample_size: int,
-    num_topics: int,
     bow_features: int,
     max_len: int,
     train_config: TrainConfig,
+    split_sizes: tuple[int, int, int],
     results_df: pd.DataFrame,
 ) -> None:
     best_idx = int(results_df["f1"].idxmax())
     best_row = results_df.loc[best_idx]
-    sampling_mode = "full filtered corpus" if sample_size <= 0 else f"capped at {sample_size} documents"
+    sampling_mode = (
+        "full dataset"
+        if sample_size <= 0 or sample_size >= dataset.available_rows
+        else f"stratified sample capped at {sample_size} rows"
+    )
+    label_map = ", ".join(
+        f"{label} ({sentiment_label_name(label)}) -> {index}"
+        for label, index in sorted(dataset.label_to_index.items())
+    )
+    train_size, val_size, test_size = split_sizes
 
     lines = [
-        "# Task5 - Text Classification with RNN Variants",
+        "# Task5 - Sentiment Classification with Dense and Recurrent Models",
         "",
         "## Setup",
         "",
         f"- Dataset: `{dataset_file}`",
-        "- Source corpus: `Corpora/News/content_only.csv`",
-        f"- Documents used in this run (after filtering): **{selected_docs}**",
+        "- Source dataset: `Task5/Sentiment140_v2.csv`",
+        f"- Samples used in this run: **{len(dataset.docs)}**",
         f"- Sampling mode: **{sampling_mode}**",
-        "- Labeling note: this dataset has no gold label column, so pseudo-topic labels were created using TF-IDF + KMeans.",
-        f"- Number of pseudo-topic classes: **{num_topics}**",
+        "- Gold labels are read directly from the `polarity` column and remapped internally to contiguous class IDs for PyTorch training.",
+        f"- Label mapping: **{label_map}**",
+        f"- Class distribution: **{format_class_distribution(dataset.class_distribution)}**",
+        f"- Train/validation/test split: **{train_size} / {val_size} / {test_size}**",
+        "- Non-sequential feature sets (`Count Vectorizer`, `TF-IDF`, `PMI`) use dense classifiers so vocabulary dimensions are not treated as a fake time axis.",
+        "- Sequence feature sets (`Word2Vec`, `GloVe`) use packed recurrent models and pool the true forward/backward hidden states.",
         "",
         "## Training Configuration",
         "",
@@ -716,16 +847,14 @@ def write_report(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Task5: RNN/BiRNN/LSTM text classification comparison")
+    parser = argparse.ArgumentParser(description="Task5: sentiment classification with dense and recurrent model comparisons")
     parser.add_argument(
         "--sample-size",
         type=int,
         default=DEFAULT_SAMPLE_SIZE,
-        help="Maximum number of filtered documents to use; set to 0 to use the full corpus.",
+        help="Maximum number of rows to use from Sentiment140_v2.csv; set to 0 to use the full dataset.",
     )
-    parser.add_argument("--topics", type=int, default=DEFAULT_TOPIC_COUNT)
     parser.add_argument("--bow-features", type=int, default=DEFAULT_BOW_FEATURES)
-    parser.add_argument("--label-tfidf-features", type=int, default=DEFAULT_LABEL_TFIDF_FEATURES)
     parser.add_argument("--max-len", type=int, default=DEFAULT_EMBED_MAX_LEN)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
@@ -749,21 +878,17 @@ def main() -> None:
     csv_file = output_dir / "task5_results.csv"
     report_file = output_dir / "task5_report.md"
 
-    dataset_file = resolve_dataset_file(project_root)
+    dataset_file = resolve_dataset_file(task_dir)
     word2vec_file = resolve_vectors_file(project_root, "Task2")
     glove_file = resolve_vectors_file(project_root, "Task3")
     cache_signature = build_cache_signature(args=args, dataset_file=dataset_file, word2vec_file=word2vec_file, glove_file=glove_file)
 
     feature_order = ["Count Vectorizer", "TF-IDF", "PMI", "Word2Vec", "GloVe"]
-    model_settings = [
-        ("RNN", "rnn", False),
-        ("Bidirectional RNN", "rnn", True),
-        ("LSTM", "lstm", False),
-    ]
+    feature_model_settings = {feature_name: model_settings_for_feature(feature_name) for feature_name in feature_order}
     expected_checkpoint_files = [
         model_cache_dir / checkpoint_file_name(feature_name, model_name)
         for feature_name in feature_order
-        for model_name, _architecture, _bidirectional in model_settings
+        for model_name, _architecture, _bidirectional in feature_model_settings[feature_name]
     ]
 
     cache_manifest = load_cache_manifest(cache_manifest_file)
@@ -782,20 +907,17 @@ def main() -> None:
         print(format_table(pd.read_csv(csv_file)))
         return
 
-    print("Loading documents...")
-    docs = load_documents(dataset_file=dataset_file, sample_size=args.sample_size, random_seed=args.seed)
-    print(f"Documents selected: {len(docs)}")
-
-    print("Creating pseudo labels with TF-IDF + KMeans...")
-    labels = create_pseudo_labels(
-        docs=docs,
-        random_seed=args.seed,
-        num_topics=args.topics,
-        max_tfidf_features=args.label_tfidf_features,
-    )
+    print("Loading labeled tweets...")
+    dataset = load_sentiment_dataset(dataset_file=dataset_file, sample_size=args.sample_size, random_seed=args.seed)
+    print(f"Samples selected: {len(dataset.docs)}")
+    print(f"Class distribution: {format_class_distribution(dataset.class_distribution)}")
 
     print("Splitting train/validation/test...")
-    train_docs, val_docs, test_docs, y_train, y_val, y_test = split_data(docs=docs, labels=labels, random_seed=args.seed)
+    train_docs, val_docs, test_docs, y_train, y_val, y_test = split_data(
+        docs=dataset.docs,
+        labels=dataset.labels,
+        random_seed=args.seed,
+    )
 
     print("Building Count/TF-IDF/PMI feature sets...")
     feature_sets = build_bow_features(
@@ -832,12 +954,13 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    num_classes = int(np.unique(labels).size)
+    num_classes = int(np.unique(dataset.labels).size)
     results: list[dict[str, float | str]] = []
     cache_hit_count = 0
 
-    for feature_name, feature_set in feature_sets.items():
-        for model_name, architecture, bidirectional in model_settings:
+    for feature_name in feature_order:
+        feature_set = feature_sets[feature_name]
+        for model_name, architecture, bidirectional in feature_model_settings[feature_name]:
             checkpoint_file = model_cache_dir / checkpoint_file_name(feature_name, model_name)
             print(f"Training {model_name} on {feature_name}...")
             metrics, seconds, from_cache = train_and_score(
@@ -871,21 +994,30 @@ def main() -> None:
             )
 
     results_df = pd.DataFrame(results)
-    model_order = {"RNN": 0, "Bidirectional RNN": 1, "LSTM": 2}
+    model_order = {
+        **{("Count Vectorizer", model_name): idx for idx, (model_name, _architecture, _bidirectional) in enumerate(DENSE_MODEL_SETTINGS)},
+        **{("TF-IDF", model_name): idx for idx, (model_name, _architecture, _bidirectional) in enumerate(DENSE_MODEL_SETTINGS)},
+        **{("PMI", model_name): idx for idx, (model_name, _architecture, _bidirectional) in enumerate(DENSE_MODEL_SETTINGS)},
+        **{("Word2Vec", model_name): idx for idx, (model_name, _architecture, _bidirectional) in enumerate(SEQUENCE_MODEL_SETTINGS)},
+        **{("GloVe", model_name): idx for idx, (model_name, _architecture, _bidirectional) in enumerate(SEQUENCE_MODEL_SETTINGS)},
+    }
     results_df["feature_order"] = results_df["feature"].map({name: idx for idx, name in enumerate(feature_order)})
-    results_df["model_order"] = results_df["model"].map(model_order)
-    results_df = results_df.sort_values(["feature_order", "model_order"]).drop(columns=["feature_order", "model_order"])
+    results_df["feature_model_key"] = list(zip(results_df["feature"], results_df["model"]))
+    results_df["model_order"] = results_df["feature_model_key"].map(model_order)
+    results_df = results_df.sort_values(["feature_order", "model_order"]).drop(
+        columns=["feature_order", "feature_model_key", "model_order"]
+    )
 
     results_df.to_csv(csv_file, index=False)
     write_report(
         report_file=report_file,
         dataset_file=dataset_file,
-        selected_docs=len(docs),
+        dataset=dataset,
         sample_size=args.sample_size,
-        num_topics=args.topics,
         bow_features=args.bow_features,
         max_len=args.max_len,
         train_config=train_config,
+        split_sizes=(len(train_docs), len(val_docs), len(test_docs)),
         results_df=results_df,
     )
     save_cache_manifest(
@@ -893,6 +1025,7 @@ def main() -> None:
         {
             "cache_signature": cache_signature,
             "generated_at_epoch": int(time.time()),
+            "pipeline_version": PIPELINE_VERSION,
             "dataset_file": file_signature(dataset_file),
             "word2vec_file": file_signature(word2vec_file),
             "glove_file": file_signature(glove_file),
@@ -901,9 +1034,7 @@ def main() -> None:
             "checkpoint_files": [str(path) for path in expected_checkpoint_files],
             "args": {
                 "sample_size": int(args.sample_size),
-                "topics": int(args.topics),
                 "bow_features": int(args.bow_features),
-                "label_tfidf_features": int(args.label_tfidf_features),
                 "max_len": int(args.max_len),
                 "batch_size": int(args.batch_size),
                 "epochs": int(args.epochs),
@@ -911,6 +1042,8 @@ def main() -> None:
                 "hidden_size": int(args.hidden_size),
                 "seed": int(args.seed),
             },
+            "class_distribution": dataset.class_distribution,
+            "label_to_index": dataset.label_to_index,
         },
     )
 
