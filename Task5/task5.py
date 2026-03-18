@@ -8,6 +8,7 @@ import math
 import random
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,20 +24,57 @@ from torch.nn.utils.rnn import pack_padded_sequence
 from torch.utils.data import DataLoader, Dataset
 
 
-TOKEN_PATTERN = re.compile(r"[^\W\d_]+", flags=re.UNICODE)
+PAD_TOKEN = "<pad>"
+UNK_TOKEN = "<unk>"
+URL_TOKEN = "<url>"
+USER_TOKEN = "@user"
+NUMBER_TOKEN = "<num>"
+
+SMART_PUNCT_TRANSLATION = str.maketrans(
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2026": "...",
+        "`": "'",
+    }
+)
+URL_PATTERN = re.compile(r"(?i)(?:https?://|www\.)\S+")
+MENTION_PATTERN = re.compile(r"@[A-Za-z0-9_]+")
+NUMBER_PATTERN = re.compile(r"\d+(?:[.,:/-]\d+)*")
+WORD_PATTERN = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)*", flags=re.UNICODE)
+PUNCT_RUN_PATTERN = re.compile(r"[!?]+|\.{2,}")
+TOKEN_PATTERN = re.compile(
+    r"""(?ix)
+    (?:https?://|www\.)\S+
+    |@[A-Za-z0-9_]+
+    |\#[A-Za-z0-9_]+
+    |<3
+    |(?:(?:[:;=8][\-o\*']?[\)\]\(\[dDpP/\:\}\{@\|\\])|(?:[\)\]\(\[dDpP/\:\}\{@\|\\][\-o\*']?[:;=8]))
+    |[^\W\d_]+(?:'[^\W\d_]+)*
+    |\d+(?:[.,:/-]\d+)*
+    |[!?]+
+    |\.{2,}
+    |[\u2600-\u26FF\u2700-\u27BF\U0001F300-\U0001FAFF]
+    """
+)
 csv.field_size_limit(2**31 - 1)
 
 DEFAULT_RANDOM_SEED = 42
 DEFAULT_SAMPLE_SIZE = 0
 DEFAULT_BOW_FEATURES = 200
 DEFAULT_EMBED_MAX_LEN = 80
+DEFAULT_EMBED_OOV_MIN_FREQ = 2
+DEFAULT_EMBED_MAX_EXTRA_VOCAB = 30000
+DEFAULT_EMBED_INIT_STD = 0.05
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 3
 DEFAULT_LEARNING_RATE = 1e-3
 DEFAULT_HIDDEN_SIZE = 64
 DEFAULT_MODEL_CACHE_DIR = "model_cache"
 DEFAULT_CACHE_MANIFEST_FILE = "model_cache_manifest.json"
-PIPELINE_VERSION = "sentiment140_supervised_dense_bow_v2"
+PIPELINE_VERSION = "sentiment140_supervised_tweet_aware_v3"
 SENTIMENT_LABEL_NAMES = {
     0: "negative",
     2: "neutral",
@@ -116,7 +154,7 @@ class RecurrentClassifier(nn.Module):
 
         if embedding_matrix is not None:
             embeddings = torch.tensor(embedding_matrix, dtype=torch.float32)
-            self.embedding = nn.Embedding.from_pretrained(embeddings, freeze=True, padding_idx=0)
+            self.embedding = nn.Embedding.from_pretrained(embeddings, freeze=False, padding_idx=0)
             input_size = embeddings.shape[1]
         else:
             input_size = 1
@@ -260,6 +298,10 @@ def build_cache_signature(
         "learning_rate": float(args.learning_rate),
         "hidden_size": int(args.hidden_size),
         "seed": int(args.seed),
+        "embed_oov_min_freq": DEFAULT_EMBED_OOV_MIN_FREQ,
+        "embed_max_extra_vocab": DEFAULT_EMBED_MAX_EXTRA_VOCAB,
+        "embed_init_std": DEFAULT_EMBED_INIT_STD,
+        "embeddings_trainable": True,
     }
     serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -291,11 +333,171 @@ def save_cache_manifest(path: Path, payload: dict[str, object]) -> None:
 
 
 def normalize_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
+    normalized = text.translate(SMART_PUNCT_TRANSLATION)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def compress_punctuation_run(token: str) -> str:
+    if token.startswith("."):
+        return "..."
+    if set(token) == {"!"}:
+        return "!" if len(token) == 1 else "!!" if len(token) == 2 else "!!!"
+    if set(token) == {"?"}:
+        return "?" if len(token) == 1 else "??" if len(token) == 2 else "???"
+    if set(token).issubset({"!", "?"}):
+        return "!?"
+    return token
+
+
+def normalize_token(token: str) -> str | None:
+    stripped = token.strip()
+    if not stripped:
+        return None
+
+    lowered = stripped.lower()
+    if URL_PATTERN.fullmatch(lowered):
+        return URL_TOKEN
+    if MENTION_PATTERN.fullmatch(lowered):
+        return USER_TOKEN
+    if NUMBER_PATTERN.fullmatch(lowered):
+        return NUMBER_TOKEN
+    if PUNCT_RUN_PATTERN.fullmatch(lowered):
+        return compress_punctuation_run(lowered)
+    return lowered
 
 
 def tokenize(text: str) -> list[str]:
-    return [match.group(0).lower() for match in TOKEN_PATTERN.finditer(text)]
+    normalized_text = normalize_text(text)
+    tokens: list[str] = []
+    for match in TOKEN_PATTERN.finditer(normalized_text):
+        token = normalize_token(match.group(0))
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def random_embedding_vector(dim: int) -> np.ndarray:
+    return np.random.normal(loc=0.0, scale=DEFAULT_EMBED_INIT_STD, size=dim).astype(np.float32)
+
+
+def token_counts(docs: list[str]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for doc in docs:
+        counts.update(tokenize(doc))
+    return counts
+
+
+def squash_character_repetitions(text: str, max_repeat: int) -> str:
+    result: list[str] = []
+    previous = ""
+    repeat_count = 0
+    for char in text:
+        if char == previous:
+            repeat_count += 1
+        else:
+            previous = char
+            repeat_count = 1
+
+        if repeat_count <= max_repeat:
+            result.append(char)
+
+    return "".join(result)
+
+
+def embedding_seed_candidates(token: str) -> list[str]:
+    candidates: list[str] = []
+
+    def add(candidate: str) -> None:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    lowered = token.lower()
+    add(lowered)
+
+    if lowered == URL_TOKEN:
+        add("url")
+        add("link")
+    elif lowered == USER_TOKEN:
+        add("user")
+        add("person")
+    elif lowered == NUMBER_TOKEN:
+        add("number")
+        add("num")
+
+    base_word = lowered[1:] if lowered.startswith("#") else lowered
+    if lowered.startswith("#"):
+        add(base_word)
+
+    if lowered in {"!!", "!!!"}:
+        add("!")
+    elif lowered in {"??", "???"}:
+        add("?")
+    elif lowered == "!?":
+        add("!")
+        add("?")
+
+    if WORD_PATTERN.fullmatch(base_word):
+        if "'" in base_word:
+            add(base_word.replace("'", ""))
+        add(squash_character_repetitions(base_word, max_repeat=2))
+        add(squash_character_repetitions(base_word, max_repeat=1))
+
+    return candidates
+
+
+def seed_embedding_vector(token: str, token_to_id: dict[str, int], embedding_matrix: np.ndarray) -> np.ndarray:
+    dim = int(embedding_matrix.shape[1])
+    for candidate in embedding_seed_candidates(token):
+        candidate_id = token_to_id.get(candidate)
+        if candidate_id is not None:
+            return embedding_matrix[candidate_id].copy()
+    return random_embedding_vector(dim)
+
+
+def extend_embedding_vocabulary(
+    train_docs: list[str],
+    token_to_id: dict[str, int],
+    embedding_matrix: np.ndarray,
+    min_freq: int = DEFAULT_EMBED_OOV_MIN_FREQ,
+    max_extra_vocab: int = DEFAULT_EMBED_MAX_EXTRA_VOCAB,
+) -> tuple[dict[str, int], np.ndarray]:
+    counts = token_counts(train_docs)
+    additional_tokens: list[str] = []
+    for token, freq in counts.most_common():
+        if freq < min_freq:
+            break
+        if token in token_to_id:
+            continue
+        additional_tokens.append(token)
+        if len(additional_tokens) >= max_extra_vocab:
+            break
+
+    if not additional_tokens:
+        return token_to_id, embedding_matrix
+
+    expanded_matrix = np.zeros((embedding_matrix.shape[0] + len(additional_tokens), embedding_matrix.shape[1]), dtype=np.float32)
+    expanded_matrix[: embedding_matrix.shape[0]] = embedding_matrix
+    expanded_token_to_id = dict(token_to_id)
+
+    for token in additional_tokens:
+        token_id = len(expanded_token_to_id)
+        expanded_token_to_id[token] = token_id
+        expanded_matrix[token_id] = seed_embedding_vector(token, token_to_id, embedding_matrix)
+
+    return expanded_token_to_id, expanded_matrix
+
+
+def resolve_token_id(token: str, token_to_id: dict[str, int]) -> int:
+    token_id = token_to_id.get(token)
+    if token_id is not None:
+        return token_id
+
+    for candidate in embedding_seed_candidates(token):
+        candidate_id = token_to_id.get(candidate)
+        if candidate_id is not None:
+            return candidate_id
+
+    return token_to_id[UNK_TOKEN]
 
 
 def sentiment_label_name(label: int) -> str:
@@ -404,12 +606,14 @@ def build_bow_features(
     test_docs: list[str],
     max_features: int,
 ) -> dict[str, FeatureSet]:
-    token_pattern = r"(?u)\b[^\W\d_]+\b"
     count_vectorizer = CountVectorizer(
         max_features=max_features,
         min_df=3,
         max_df=0.95,
-        token_pattern=token_pattern,
+        lowercase=False,
+        preprocessor=None,
+        token_pattern=None,
+        tokenizer=tokenize,
     )
     x_train_count = count_vectorizer.fit_transform(train_docs).astype(np.float32)
     x_val_count = count_vectorizer.transform(val_docs).astype(np.float32)
@@ -419,7 +623,10 @@ def build_bow_features(
         vocabulary=count_vectorizer.vocabulary_,
         min_df=3,
         max_df=0.95,
-        token_pattern=token_pattern,
+        lowercase=False,
+        preprocessor=None,
+        token_pattern=None,
+        tokenizer=tokenize,
     )
     x_train_tfidf = tfidf_vectorizer.fit_transform(train_docs).astype(np.float32)
     x_val_tfidf = tfidf_vectorizer.transform(val_docs).astype(np.float32)
@@ -472,6 +679,9 @@ def load_pretrained_embeddings(vectors_file: Path) -> tuple[dict[str, int], np.n
                 word = first_line[0]
                 values = np.asarray(first_line[1:], dtype=np.float32)
                 if values.size == dim:
+                    norm = float(np.linalg.norm(values))
+                    if norm > 0.0:
+                        values = values / norm
                     words.append(word)
                     vectors.append(values)
 
@@ -500,9 +710,13 @@ def load_pretrained_embeddings(vectors_file: Path) -> tuple[dict[str, int], np.n
     if dim is None or not vectors:
         raise RuntimeError(f"No vectors could be loaded from {vectors_file}")
 
-    embedding_matrix = np.zeros((len(vectors) + 1, dim), dtype=np.float32)
-    token_to_id: dict[str, int] = {}
-    for idx, (word, vector) in enumerate(zip(words, vectors), start=1):
+    embedding_matrix = np.zeros((len(vectors) + 2, dim), dtype=np.float32)
+    embedding_matrix[1] = random_embedding_vector(dim)
+    token_to_id: dict[str, int] = {
+        PAD_TOKEN: 0,
+        UNK_TOKEN: 1,
+    }
+    for idx, (word, vector) in enumerate(zip(words, vectors), start=2):
         embedding_matrix[idx] = vector
         token_to_id[word] = idx
 
@@ -518,7 +732,7 @@ def docs_to_token_sequences(
     lengths = np.zeros(len(docs), dtype=np.int64)
 
     for doc_index, doc in enumerate(docs):
-        token_ids = [token_to_id[token] for token in tokenize(doc) if token in token_to_id]
+        token_ids = [resolve_token_id(token, token_to_id) for token in tokenize(doc)]
         if not token_ids:
             continue
 
@@ -539,6 +753,11 @@ def build_embedding_feature_set(
     max_len: int,
 ) -> FeatureSet:
     token_to_id, embedding_matrix = load_pretrained_embeddings(vectors_file)
+    token_to_id, embedding_matrix = extend_embedding_vocabulary(
+        train_docs=train_docs,
+        token_to_id=token_to_id,
+        embedding_matrix=embedding_matrix,
+    )
 
     train_x, train_len = docs_to_token_sequences(train_docs, token_to_id, max_len=max_len)
     val_x, val_len = docs_to_token_sequences(val_docs, token_to_id, max_len=max_len)
@@ -810,13 +1029,18 @@ def write_report(
         f"- Label mapping: **{label_map}**",
         f"- Class distribution: **{format_class_distribution(dataset.class_distribution)}**",
         f"- Train/validation/test split: **{train_size} / {val_size} / {test_size}**",
+        "- A tweet-aware tokenizer is used across all feature sets, preserving hashtags, mentions, contractions, emoticons, emojis, elongated words, and repeated punctuation.",
         "- Non-sequential feature sets (`Count Vectorizer`, `TF-IDF`, `PMI`) use dense classifiers so vocabulary dimensions are not treated as a fake time axis.",
-        "- Sequence feature sets (`Word2Vec`, `GloVe`) use packed recurrent models and pool the true forward/backward hidden states.",
+        "- Sequence feature sets (`Word2Vec`, `GloVe`) extend the pretrained vocabularies with frequent tweet tokens and map any remaining unseen items to `<unk>` instead of silently dropping them.",
+        "- Pretrained sequence embeddings are fine-tuned during sentiment training (`freeze=False`) so the model can adapt them to Sentiment140.",
+        "- Sequence feature sets use packed recurrent models and pool the true forward/backward hidden states.",
         "",
         "## Training Configuration",
         "",
         f"- BOW vocabulary size (`Count`, `TF-IDF`, `PMI`): **{bow_features}**",
         f"- Max token length (`Word2Vec`, `GloVe`): **{max_len}**",
+        f"- Extra tweet-token embeddings added per pretrained vocabulary (max): **{DEFAULT_EMBED_MAX_EXTRA_VOCAB}**",
+        f"- Minimum train frequency before adding a new tweet-token embedding: **{DEFAULT_EMBED_OOV_MIN_FREQ}**",
         f"- Batch size: **{train_config.batch_size}**",
         f"- Epochs per model: **{train_config.epochs}**",
         f"- Hidden size: **{train_config.hidden_size}**",
