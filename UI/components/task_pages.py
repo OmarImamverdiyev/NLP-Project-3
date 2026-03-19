@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -10,9 +11,14 @@ from UI.task_service import (
     ensure_task_outputs,
     find_similar_words_for_task,
     list_task5_checkpoints,
+    predict_task5_sentiment,
+    solve_vector_equation_for_task,
     similarity_example_words,
+    task5_inference_status,
+    task5_model_options,
     task_outputs,
     task_title,
+    vector_arithmetic_examples,
 )
 
 
@@ -28,6 +34,18 @@ def _similarity_result_key(task_id: str) -> str:
     return f"similarity_result_{task_id}"
 
 
+def _comparison_similarity_result_key(task_id: str) -> str:
+    return f"comparison_similarity_result_{task_id}"
+
+
+def _comparison_vector_result_key(task_id: str) -> str:
+    return f"comparison_vector_result_{task_id}"
+
+
+def _task5_sentiment_result_key() -> str:
+    return "task5_sentiment_result"
+
+
 def _run_task(task_id: str, force: bool) -> None:
     st.session_state.pop(_error_key(task_id), None)
     try:
@@ -40,11 +58,11 @@ def _run_task(task_id: str, force: bool) -> None:
 
 def _render_run_controls(task_id: str, force_button: bool = True) -> None:
     run_col, force_col = st.columns(2)
-    if run_col.button("Run / Use Saved Results", key=f"run_{task_id}", use_container_width=True):
+    if run_col.button("Run / Use Saved Results", key=f"run_{task_id}", width="stretch"):
         _run_task(task_id=task_id, force=False)
 
     if force_button:
-        if force_col.button("Force Rebuild", key=f"force_{task_id}", use_container_width=True):
+        if force_col.button("Force Rebuild", key=f"force_{task_id}", width="stretch"):
             _run_task(task_id=task_id, force=True)
 
     error_text = st.session_state.get(_error_key(task_id))
@@ -91,7 +109,7 @@ def _render_table(path: Path, title: str, sep: str = ",", preview_rows: int = 25
         st.error(f"Could not load table: {exc}")
         return
 
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
 
 
 def _render_file_size(path: Path, label: str) -> None:
@@ -100,6 +118,84 @@ def _render_file_size(path: Path, label: str) -> None:
         return
     size_mb = path.stat().st_size / (1024 * 1024)
     st.caption(f"{label}: `{path.relative_to(PROJECT_ROOT)}` ({size_mb:.2f} MB)")
+
+
+def _merge_examples(*groups: list[str], limit: int = 8) -> list[str]:
+    merged: list[str] = []
+    for group in groups:
+        for item in group:
+            if item in merged:
+                continue
+            merged.append(item)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+def _render_suggestions(suggestions: Any) -> None:
+    if isinstance(suggestions, dict):
+        for word, options in suggestions.items():
+            if not options:
+                continue
+            st.caption(f"Suggestions for `{word}`: " + ", ".join(f"`{option}`" for option in options))
+        return
+
+    if suggestions:
+        st.caption("Try one of these: " + ", ".join(f"`{word}`" for word in suggestions))
+
+
+def _render_similarity_result(result: dict[str, Any] | None, vectors_path: Path, empty_message: str) -> None:
+    if not result:
+        if not vectors_path.exists():
+            st.info("Run this task once to generate vectors, then use this search box.")
+        else:
+            st.info(empty_message)
+        return
+
+    status = result.get("status", "")
+    if status == "ok":
+        st.caption(
+            f"Showing neighbors for `{result['query_word']}` "
+            f"from `{result['vocab_size']}` words with dimension `{result['dimension']}`."
+        )
+        st.dataframe(pd.DataFrame(result["results"]), width="stretch", hide_index=True)
+        return
+
+    if status in {"missing_vectors", "empty_query", "word_not_found"}:
+        st.warning(result.get("message", "Could not complete the similarity search."))
+        _render_suggestions(result.get("suggestions"))
+        return
+
+    st.error(result.get("message", "Unexpected error while searching similar words."))
+
+
+def _render_vector_arithmetic_result(result: dict[str, Any] | None, vectors_path: Path, empty_message: str) -> None:
+    if not result:
+        if not vectors_path.exists():
+            st.info("Run this task once to generate vectors, then use this vector arithmetic tool.")
+        else:
+            st.info(empty_message)
+        return
+
+    equation = result.get("equation", "")
+    if equation:
+        st.caption(f"Equation: `{equation}`")
+
+    status = result.get("status", "")
+    if status == "ok":
+        st.caption(
+            f"Showing top predictions from `{result['vocab_size']}` words "
+            f"with dimension `{result['dimension']}`."
+        )
+        st.dataframe(pd.DataFrame(result["results"]), width="stretch", hide_index=True)
+        return
+
+    if status in {"missing_vectors", "empty_query", "word_not_found", "degenerate_query"}:
+        st.warning(result.get("message", "Could not complete the vector arithmetic search."))
+        _render_suggestions(result.get("suggestions"))
+        return
+
+    st.error(result.get("message", "Unexpected error while running vector arithmetic."))
 
 
 def _render_similarity_search(task_id: str, model_label: str, vectors_path: Path) -> None:
@@ -116,7 +212,7 @@ def _render_similarity_search(task_id: str, model_label: str, vectors_path: Path
             key=f"similarity_query_{task_id}",
             placeholder="Enter a vocabulary word",
         )
-        submitted = st.form_submit_button("Find 5 Similar Words", use_container_width=True)
+        submitted = st.form_submit_button("Find 5 Similar Words", width="stretch")
 
     if submitted:
         try:
@@ -132,28 +228,238 @@ def _render_similarity_search(task_id: str, model_label: str, vectors_path: Path
             }
 
     result = st.session_state.get(_similarity_result_key(task_id))
-    if not result:
-        if not vectors_path.exists():
-            st.info("Run this task once to generate vectors, then use this search box.")
-        return
+    _render_similarity_result(
+        result=result,
+        vectors_path=vectors_path,
+        empty_message="Search for a word to see its 5 nearest neighbors.",
+    )
 
-    status = result.get("status", "")
-    if status == "ok":
-        st.caption(
-            f"Showing neighbors for `{result['query_word']}` "
-            f"from `{result['vocab_size']}` words with dimension `{result['dimension']}`."
+
+def _render_task4_similarity_comparison() -> None:
+    st.subheader("Interactive Similarity Comparison")
+    st.caption("Search one word once and compare Task 2 on the left with Task 3 on the right.")
+
+    examples = _merge_examples(
+        similarity_example_words("task2"),
+        similarity_example_words("task3"),
+        limit=8,
+    )
+    if examples:
+        st.caption("Example queries: " + ", ".join(f"`{word}`" for word in examples))
+
+    with st.form(key="task4_similarity_comparison_form"):
+        query_word = st.text_input(
+            "Query word",
+            key="task4_similarity_query",
+            placeholder="Enter one word to compare across both models",
         )
-        st.dataframe(pd.DataFrame(result["results"]), use_container_width=True, hide_index=True)
+        submitted = st.form_submit_button("Compare Top 5 Similar Words", width="stretch")
+
+    if submitted:
+        for task_id in ("task2", "task3"):
+            try:
+                st.session_state[_comparison_similarity_result_key(task_id)] = find_similar_words_for_task(
+                    task_id=task_id,
+                    query_word=query_word,
+                    limit=5,
+                )
+            except Exception as exc:
+                st.session_state[_comparison_similarity_result_key(task_id)] = {
+                    "status": "error",
+                    "message": str(exc),
+                }
+
+    left_col, right_col = st.columns(2)
+    with left_col:
+        st.markdown("### Left: Task 2 - Word2Vec")
+        _render_similarity_result(
+            result=st.session_state.get(_comparison_similarity_result_key("task2")),
+            vectors_path=task_outputs("task2")["vectors"],
+            empty_message="Submit a word to compare Word2Vec neighbors.",
+        )
+
+    with right_col:
+        st.markdown("### Right: Task 3 - GloVe")
+        _render_similarity_result(
+            result=st.session_state.get(_comparison_similarity_result_key("task3")),
+            vectors_path=task_outputs("task3")["vectors"],
+            empty_message="Submit a word to compare GloVe neighbors.",
+        )
+
+
+def _render_task4_vector_arithmetic_comparison() -> None:
+    st.subheader("Interactive Vector Arithmetic Comparison")
+    st.caption("Use the same `A - B + C` expression against both models and compare the top predictions.")
+
+    examples = _merge_examples(
+        vector_arithmetic_examples("task2"),
+        vector_arithmetic_examples("task3"),
+        limit=6,
+    )
+    if examples:
+        st.caption("Example equations: " + ", ".join(f"`{equation}`" for equation in examples))
+
+    with st.form(key="task4_vector_comparison_form"):
+        word_a_col, word_b_col, word_c_col = st.columns(3)
+        word_a = word_a_col.text_input("Word A", key="task4_vector_word_a", placeholder="moskva")
+        word_b = word_b_col.text_input("Word B", key="task4_vector_word_b", placeholder="rusiya")
+        word_c = word_c_col.text_input("Word C", key="task4_vector_word_c", placeholder="ukrayna")
+        submitted = st.form_submit_button("Compare Vector Arithmetic", width="stretch")
+
+    if submitted:
+        if not word_a.strip() or not word_b.strip() or not word_c.strip():
+            shared_error = {
+                "status": "empty_query",
+                "message": "Enter all three words to compare the `A - B + C` expression.",
+            }
+            st.session_state[_comparison_vector_result_key("task2")] = shared_error
+            st.session_state[_comparison_vector_result_key("task3")] = shared_error.copy()
+        else:
+            for task_id in ("task2", "task3"):
+                try:
+                    st.session_state[_comparison_vector_result_key(task_id)] = solve_vector_equation_for_task(
+                        task_id=task_id,
+                        positive_words=[word_a, word_c],
+                        negative_words=[word_b],
+                        limit=5,
+                    )
+                except Exception as exc:
+                    st.session_state[_comparison_vector_result_key(task_id)] = {
+                        "status": "error",
+                        "message": str(exc),
+                    }
+
+    left_col, right_col = st.columns(2)
+    with left_col:
+        st.markdown("### Left: Task 2 - Word2Vec")
+        _render_vector_arithmetic_result(
+            result=st.session_state.get(_comparison_vector_result_key("task2")),
+            vectors_path=task_outputs("task2")["vectors"],
+            empty_message="Submit an equation to compare Word2Vec predictions.",
+        )
+
+    with right_col:
+        st.markdown("### Right: Task 3 - GloVe")
+        _render_vector_arithmetic_result(
+            result=st.session_state.get(_comparison_vector_result_key("task3")),
+            vectors_path=task_outputs("task3")["vectors"],
+            empty_message="Submit an equation to compare GloVe predictions.",
+        )
+
+
+def _render_task4_saved_results() -> None:
+    task2_outputs = task_outputs("task2")
+    task3_outputs = task_outputs("task3")
+
+    st.subheader("Saved Result Comparison")
+    st.caption("Task 2 is shown on the left and Task 3 is shown on the right so you can compare the stored outputs.")
+
+    overview_left, overview_right = st.columns(2)
+    with overview_left:
+        st.markdown("### Left: Task 2 - Word2Vec")
+        _render_file_size(task2_outputs["vectors"], "Vector file")
+        _render_file_size(task2_outputs["vocab"], "Vocabulary file")
+
+    with overview_right:
+        st.markdown("### Right: Task 3 - GloVe")
+        _render_file_size(task3_outputs["vectors"], "Vector file")
+        _render_file_size(task3_outputs["vocab"], "Vocabulary file")
+
+    similarity_left, similarity_right = st.columns(2)
+    with similarity_left:
+        st.markdown("### Left: Task 2 - Word2Vec")
+        _render_table(task2_outputs["synonyms"], "Top-5 Similarity Results", sep="\t", preview_rows=20)
+
+    with similarity_right:
+        st.markdown("### Right: Task 3 - GloVe")
+        _render_table(task3_outputs["synonyms"], "Top-5 Similarity Results", sep="\t", preview_rows=20)
+
+    equation_left, equation_right = st.columns(2)
+    with equation_left:
+        st.markdown("### Left: Task 2 - Word2Vec")
+        _render_table(task2_outputs["equations"], "Vector Arithmetic Results", sep="\t", preview_rows=15)
+
+    with equation_right:
+        st.markdown("### Right: Task 3 - GloVe")
+        _render_table(task3_outputs["equations"], "Vector Arithmetic Results", sep="\t", preview_rows=15)
+
+    relation_left, relation_right = st.columns(2)
+    with relation_left:
+        st.markdown("### Left: Task 2 - Word2Vec")
+        _render_table(task2_outputs["relations"], "Relation Pattern Results", sep="\t", preview_rows=15)
+
+    with relation_right:
+        st.markdown("### Right: Task 3 - GloVe")
+        _render_table(task3_outputs["relations"], "Relation Pattern Results", sep="\t", preview_rows=15)
+
+
+def _render_task5_sentiment_predictor() -> None:
+    st.subheader("Interactive Sentiment Prediction")
+    st.caption("Write a sentence, choose one saved Task5 model, and predict its sentiment.")
+
+    status = task5_inference_status()
+    if status["status"] == "missing_artifacts":
+        st.warning(status["message"])
+        return
+    if status["status"] == "incompatible_cache":
+        st.warning(status["message"])
+
+    model_options = task5_model_options()
+    if not model_options:
+        st.warning("No Task5 model options are available yet.")
         return
 
-    if status in {"missing_vectors", "empty_query", "word_not_found"}:
-        st.warning(result.get("message", "Could not complete the similarity search."))
-        suggestions = result.get("suggestions") or []
-        if suggestions:
-            st.caption("Try one of these: " + ", ".join(f"`{word}`" for word in suggestions))
+    option_lookup = {option["id"]: option for option in model_options}
+    with st.form(key="task5_sentiment_prediction_form"):
+        sentence = st.text_area(
+            "Sentence",
+            key="task5_sentiment_sentence",
+            placeholder="Write a sentence to test the model's sentiment prediction",
+            height=120,
+        )
+        selected_model_id = st.selectbox(
+            "Model",
+            options=[option["id"] for option in model_options],
+            key="task5_sentiment_model",
+            format_func=lambda option_id: option_lookup[option_id]["label"],
+        )
+        submitted = st.form_submit_button("Predict Sentiment", width="stretch")
+
+    if submitted:
+        try:
+            with st.spinner("Predicting sentiment..."):
+                result = predict_task5_sentiment(selected_model_id, sentence)
+            result["input_sentence"] = sentence.strip()
+            st.session_state[_task5_sentiment_result_key()] = result
+        except Exception as exc:
+            st.session_state[_task5_sentiment_result_key()] = {
+                "status": "error",
+                "message": str(exc),
+                "input_sentence": sentence.strip(),
+            }
+
+    result = st.session_state.get(_task5_sentiment_result_key())
+    if not result:
+        st.info("Submit a sentence to see the predicted sentiment.")
         return
 
-    st.error(result.get("message", "Unexpected error while searching similar words."))
+    if result.get("status") == "ok":
+        st.success(
+            f"Predicted sentiment: `{result['sentiment_label']}` "
+            f"with confidence `{result['confidence']:.2%}`"
+        )
+        st.caption(f"Sentence checked: `{result.get('input_sentence', '')}`")
+        st.caption(f"Model used: `{result['feature']} + {result['model']}`")
+        st.dataframe(pd.DataFrame(result["scores"]), width="stretch", hide_index=True)
+        return
+
+    if result.get("status") in {"empty_query", "missing_checkpoint", "invalid_checkpoint", "incompatible_cache"}:
+        if result.get("input_sentence"):
+            st.caption(f"Sentence checked: `{result['input_sentence']}`")
+        st.warning(result.get("message", "Could not predict sentiment for the provided sentence."))
+        return
+
+    st.error(result.get("message", "Unexpected error during sentiment prediction."))
 
 
 def render_task1_page() -> None:
@@ -201,14 +507,24 @@ def render_task3_page() -> None:
 def render_task4_page() -> None:
     outputs = task_outputs("task4")
     st.header(task_title("task4"))
-    _render_run_controls("task4", force_button=False)
-    _render_markdown(outputs["report"], "Comparison Report")
+    st.info(
+        "Task 4 is a direct UI comparison view: Task 2 (Word2Vec) is shown on the left and "
+        "Task 3 (GloVe) is shown on the right so users can compare the same results interactively."
+    )
+    _render_task4_similarity_comparison()
+    _render_task4_vector_arithmetic_comparison()
+    _render_task4_saved_results()
+
+    with st.expander("Task 4 Written Comparison Report"):
+        _render_markdown(outputs["report"], "Comparison Report")
 
 
 def render_task5_page() -> None:
     outputs = task_outputs("task5")
     st.header(task_title("task5"))
     _render_run_controls("task5")
+
+    _render_task5_sentiment_predictor()
 
     checkpoints = list_task5_checkpoints()
     st.subheader("Saved Model Checkpoints")
