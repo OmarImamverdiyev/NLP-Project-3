@@ -6,6 +6,11 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from UI.components.embedding_visuals import (
+    render_task2_visuals,
+    render_task3_visuals,
+    render_task4_visuals,
+)
 from UI.task_service import (
     PROJECT_ROOT,
     ensure_task_outputs,
@@ -480,6 +485,7 @@ def render_task2_page() -> None:
 
     _render_file_size(outputs["vectors"], "Word2Vec vectors")
     _render_file_size(outputs["vocab"], "Word2Vec vocabulary")
+    render_task2_visuals()
     _render_similarity_search("task2", "Word2Vec", outputs["vectors"])
 
     _render_markdown(outputs["report"], "Report")
@@ -495,6 +501,7 @@ def render_task3_page() -> None:
 
     _render_file_size(outputs["vectors"], "GloVe vectors")
     _render_file_size(outputs["vocab"], "GloVe vocabulary")
+    render_task3_visuals()
     _render_similarity_search("task3", "GloVe", outputs["vectors"])
 
     _render_markdown(outputs["report"], "Report")
@@ -511,6 +518,7 @@ def render_task4_page() -> None:
         "Task 4 is a direct UI comparison view: Task 2 (Word2Vec) is shown on the left and "
         "Task 3 (GloVe) is shown on the right so users can compare the same results interactively."
     )
+    render_task4_visuals()
     _render_task4_similarity_comparison()
     _render_task4_vector_arithmetic_comparison()
     _render_task4_saved_results()

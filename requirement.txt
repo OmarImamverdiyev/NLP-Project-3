@@ -1,0 +1,10 @@
+# Direct Python dependencies discovered from project imports.
+# Task2 and Task3 also require a local GCC toolchain plus the cloned
+# C sources in `Task2/word2vec` and `Task3/glove`.
+
+numpy==2.4.3
+pandas==2.3.3
+scikit-learn==1.8.0
+scipy==1.17.1
+streamlit==1.55.0
+torch==2.10.0

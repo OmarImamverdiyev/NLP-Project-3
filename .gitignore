@@ -54,3 +54,7 @@ dist/
 
 Task5/Sentiment140.csv
 Task5/Sentiment140_v2.csv
+
+build_conf.py
+*.jpg
+*.tex
